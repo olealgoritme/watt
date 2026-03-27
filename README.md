@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" alt="watt logo" width="400"/>
+</p>
+
 # watt
 
 ![watt overview](screenshots/overview.png)

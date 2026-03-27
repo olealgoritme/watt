@@ -33,9 +33,16 @@
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/topology.h>
+#include <linux/version.h>
 #include <asm/msr.h>
 #include <asm/processor.h>
 #include <asm/cpu_device_id.h>
+
+/* Linux 6.17+ renamed rdmsrl_safe → rdmsrq_safe */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+  #define rdmsrl_safe(msr, val)              rdmsrq_safe(msr, val)
+  #define rdmsrl_safe_on_cpu(cpu, msr, val)  rdmsrq_safe_on_cpu(cpu, msr, val)
+#endif
 
 #include "powmon.h"
 
