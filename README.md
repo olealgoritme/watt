@@ -28,6 +28,32 @@ sudo insmod kernel/powmon.ko track_all=1
 sudo ./watt
 ```
 
+## Utils
+
+`powmon-cli` lets you query the kernel module directly from scripts or the command line:
+
+```bash
+powmon-cli info              # system info and RAPL capabilities
+powmon-cli track <pid>       # start tracking a specific PID
+powmon-cli track-all         # track all processes
+powmon-cli pid <pid>         # query current wattage for a PID
+powmon-cli core <id>         # query per-core energy
+powmon-cli package <id>      # query per-package energy
+powmon-cli config [ms]       # get/set sampling interval
+powmon-cli reset             # reset all stats
+```
+
+Example — get point-in-time power draw for a process:
+```bash
+sudo ./tools/powmon-cli track 1234
+sleep 2
+sudo ./tools/powmon-cli pid 1234
+# === PID 1234 (firefox) ===
+# CPU energy:    152.341 mJ (2.305 W)
+# DRAM energy:    18.221 mJ (0.276 W)
+# Total energy:  170.562 mJ (2.581 W)
+```
+
 ## Project structure
 
 ```
