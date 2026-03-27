@@ -1,5 +1,7 @@
 # watt
 
+![watt overview](screenshots/overview.png)
+
 Per-process power monitoring TUI for Linux. Reads RAPL MSRs via a kernel module and shows real-time wattage per process, core, and package.
 
 Supports Intel (Sandy Bridge+) and AMD (Zen+).
