@@ -1,0 +1,4 @@
+obj-m += powmon.o
+powmon-objs := src/powmon.o
+
+ccflags-y := -I$(src)/include -Wall -Werror
