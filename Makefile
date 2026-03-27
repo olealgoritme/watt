@@ -5,7 +5,7 @@ CC   ?= gcc
 POWMON_H := kernel/include/powmon.h
 FLUX_H   := lib/flux.h/flux.h
 
-.PHONY: all watt module tools clean install load unload reload submodules
+.PHONY: all watt module tools clean install uninstall load unload reload submodules
 
 all: watt module tools
 	@echo ""
@@ -16,7 +16,10 @@ all: watt module tools
 	@echo ""
 	@echo "  Quick start:"
 	@echo "    sudo insmod kernel/powmon.ko track_all=1"
-	@echo "    sudo watt"
+	@echo "    sudo ./watt"
+	@echo ""
+	@echo "  Install globally:"
+	@echo "    sudo make install"
 
 # ── dependencies ─────────────────────────────────────────────
 submodules: $(FLUX_H)
@@ -31,9 +34,18 @@ watt: src/watt.c $(FLUX_H) $(POWMON_H)
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD)/kernel modules
 
-install:
+install: all
 	$(MAKE) -C $(KDIR) M=$(PWD)/kernel modules_install
 	depmod -a
+	install -Dm755 watt $(DESTDIR)/usr/local/bin/watt
+	@echo ""
+	@echo "  Installed:"
+	@echo "    watt          → $(DESTDIR)/usr/local/bin/watt"
+	@echo "    powmon.ko     → /lib/modules/$(shell uname -r)/"
+	@echo ""
+
+uninstall:
+	rm -f $(DESTDIR)/usr/local/bin/watt
 
 # ── tools ────────────────────────────────────────────────────
 tools: tools/powmon-cli tools/powmon-top

@@ -2,7 +2,7 @@
   <img src="logo.svg" alt="watt logo" width="400"/>
 </p>
 
-# watt
+# ⚡ watt
 
 ![watt overview](screenshots/overview.png)
 ![watt processes](screenshots/processes.png)
