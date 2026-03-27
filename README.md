@@ -7,9 +7,12 @@
 ![watt overview](screenshots/overview.png)
 ![watt processes](screenshots/processes.png)
 
-Per-process power monitoring TUI for Linux. Reads RAPL MSRs via a kernel module and shows real-time wattage per process, core, and package.
+Per-process power monitoring TUI for Linux.
 
-Supports Intel (Sandy Bridge+) and AMD (Zen+).
+- Real-time wattage per process, core, and package
+- Custom kernel module (`powmon`) reads RAPL MSRs directly — communicates via `ioctl` on `/dev/powmon`
+- Minimal overhead — no polling from userspace, no perf_events, no powercap sysfs
+- Intel (Sandy Bridge+) and AMD (Zen+)
 
 ## Build
 
