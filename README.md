@@ -4,8 +4,11 @@
 
 # ⚡ watt
 
-![watt overview](screenshots/overview.png)
-![watt processes](screenshots/processes.png)
+<p align="center">
+  <img src="screenshots/overview.png" alt="watt overview"/>
+  <br/>
+  <img src="screenshots/processes.png" alt="watt processes"/>
+</p>
 
 Per-process power monitoring TUI for Linux.
 
