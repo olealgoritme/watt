@@ -17,8 +17,8 @@
   <rect x="2" y="2" width="396" height="136" rx="20" ry="20" fill="#0d1117" stroke="#1c2333" stroke-width="2"/>
 
   <!-- Lightning bolt -->
-  <g filter="url(#glow)" transform="translate(40, 20)">
-    <polygon points="48,0 18,52 38,52 28,92 68,36 46,36 58,0"
+  <g filter="url(#glow)" transform="translate(40, 24)">
+    <polygon points="48,4 18,52 38,52 28,88 68,36 46,36 58,4"
              fill="url(#bolt-grad)" stroke="none"/>
   </g>
 
