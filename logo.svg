@@ -30,7 +30,7 @@
 
   <!-- Subtle tagline -->
   <text x="140" y="108" font-family="'SF Mono','Fira Code','Cascadia Code','Consolas',monospace"
-        font-size="11" fill="#7d8590" letter-spacing="2">
+        font-size="11" fill="#9da5b0" letter-spacing="2">
     per-process power monitoring
   </text>
 </svg>
