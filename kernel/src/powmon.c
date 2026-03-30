@@ -86,6 +86,8 @@ struct powmon_core_data {
 	u64 attributed_energy_uj;
 	u64 attributed_power_uw;
 	u32 package_id;
+	/* AMD per-core energy (MSR_AMD_CORE_ENERGY_STATUS) */
+	u64 prev_core_energy_raw;
 };
 
 /* Per-package RAPL state */
@@ -104,6 +106,19 @@ struct powmon_package_data {
 
 	/* Which CPU to read MSRs from for this package */
 	int representative_cpu;
+
+	/* Throttle status (Intel MSR_CORE_PERF_LIMIT_REASONS) */
+	u32 throttle_active;
+	u32 throttle_logged;
+
+	/* Power limits (Intel MSR_PKG_POWER_LIMIT) */
+	u32 pl1_raw;
+	u32 pl1_enable;
+	u32 pl1_clamp;
+	u32 pl2_raw;
+	u32 pl2_enable;
+	u32 pl2_clamp;
+	u32 power_limit_locked;
 };
 
 /* Per-cgroup tracking */
@@ -139,6 +154,7 @@ static u64 energy_unit_uj_pkg;   /* fixed-point: units * 1000000 */
 static u64 energy_unit_uj_dram;
 static u32 raw_energy_unit_pkg;
 static u32 raw_energy_unit_dram;
+static u64 power_unit_mw;  /* milliwatts per raw power limit unit */
 
 /* RAPL counter overflow: 32-bit counter */
 #define RAPL_COUNTER_MAX  0xFFFFFFFFULL
@@ -177,6 +193,14 @@ static int powmon_read_energy_units(void)
 
 	if (ret)
 		return ret;
+
+	/* Power unit is bits [3:0] */
+	{
+		u32 pu = val & 0x0F;
+		power_unit_mw = 1000ULL / (1ULL << pu);
+		if (pu > 10)
+			power_unit_mw = 1;
+	}
 
 	/* ESU is bits [12:8] */
 	esu = (val >> 8) & 0x1F;
@@ -316,6 +340,9 @@ static int powmon_detect_vendor(void)
 	return 0;
 }
 
+/* Forward declarations */
+static void powmon_read_power_limits(u32 pkg_idx);
+
 /* ---------- Package / core init ---------- */
 
 static int powmon_init_packages(void)
@@ -362,6 +389,9 @@ static int powmon_init_packages(void)
 			if (msr && !read_rapl_msr_on_cpu(rep, msr, &val))
 				packages[i].prev_energy_raw[d] = val & RAPL_COUNTER_MAX;
 		}
+
+		/* Read initial power limits (Intel only) */
+		powmon_read_power_limits(i);
 	}
 
 	return 0;
@@ -379,6 +409,13 @@ static int powmon_init_cores(void)
 		if ((u32)cpu >= nr_cores)
 			break;
 		cores[cpu].package_id = topology_physical_package_id(cpu);
+
+		/* Read initial AMD per-core energy counter */
+		if (cpu_vendor == POWMON_VENDOR_AMD) {
+			u64 raw;
+			if (!read_rapl_msr_on_cpu(cpu, MSR_AMD_CORE_ENERGY_STATUS, &raw))
+				cores[cpu].prev_core_energy_raw = raw & RAPL_COUNTER_MAX;
+		}
 	}
 
 	return 0;
@@ -670,50 +707,114 @@ static void powmon_attribute_to_pids(void)
 
 static void powmon_attribute_to_cores(void)
 {
-	/*
-	 * For per-core attribution, if Intel PP0 per-core MSRs are available
-	 * (AMD family 19h+), we can read them directly. Otherwise, we
-	 * approximate from CPU idle time ratios.
-	 *
-	 * For AMD Zen, MSR_AMD_CORE_ENERGY_STATUS can be read per-core
-	 * via rdmsr on each core's CPU.
-	 *
-	 * Simplified approach: distribute package PKG energy proportional
-	 * to each core's non-idle time.
-	 */
 	u32 i;
 
+	if (cpu_vendor == POWMON_VENDOR_AMD) {
+		/*
+		 * AMD Zen: read MSR_AMD_CORE_ENERGY_STATUS per logical CPU.
+		 * This gives actual hardware-measured per-core energy.
+		 */
+		ktime_t now = ktime_get();
+		u64 dt_ns = ktime_to_ns(ktime_sub(now, last_sample_time));
+		if (dt_ns == 0)
+			dt_ns = 1;
+
+		for (i = 0; i < nr_cores && i < (u32)num_online_cpus(); i++) {
+			u64 raw, prev, delta, energy_uj;
+
+			if (read_rapl_msr_on_cpu(i, MSR_AMD_CORE_ENERGY_STATUS, &raw))
+				continue;
+
+			raw &= RAPL_COUNTER_MAX;
+			prev = cores[i].prev_core_energy_raw;
+
+			if (raw >= prev)
+				delta = raw - prev;
+			else
+				delta = (RAPL_COUNTER_MAX - prev) + raw + 1;
+
+			cores[i].prev_core_energy_raw = raw;
+			energy_uj = rapl_raw_to_uj(delta, energy_unit_uj_pkg);
+			cores[i].attributed_energy_uj = energy_uj;
+			cores[i].attributed_power_uw =
+				div64_u64(energy_uj * 1000000000ULL, dt_ns);
+		}
+		return;
+	}
+
+	/* Intel / fallback: distribute package PKG energy equally */
 	for (i = 0; i < nr_cores && i < (u32)num_online_cpus(); i++) {
 		u32 pkg = cores[i].package_id;
 		u64 pkg_delta;
+		u32 cores_in_pkg = 0;
+		u32 j;
 
 		if (pkg >= nr_packages)
 			continue;
 
 		pkg_delta = packages[pkg].delta_energy_uj[POWMON_DOMAIN_PKG];
 
-		/*
-		 * Simple equal distribution as baseline.
-		 * A production implementation would use per-core idle
-		 * counters from /proc/stat or kernel_cpustat.
-		 */
-		if (nr_cores > 0) {
-			u32 cores_in_pkg = 0;
-			u32 j;
-
-			for (j = 0; j < nr_cores; j++) {
-				if (cores[j].package_id == pkg)
-					cores_in_pkg++;
-			}
-
-			if (cores_in_pkg > 0) {
-				cores[i].attributed_energy_uj =
-					div64_u64(pkg_delta, cores_in_pkg);
-				cores[i].attributed_power_uw =
-					div64_u64(packages[pkg].power_uw[POWMON_DOMAIN_PKG],
-						  cores_in_pkg);
-			}
+		for (j = 0; j < nr_cores; j++) {
+			if (cores[j].package_id == pkg)
+				cores_in_pkg++;
 		}
+
+		if (cores_in_pkg > 0) {
+			cores[i].attributed_energy_uj =
+				div64_u64(pkg_delta, cores_in_pkg);
+			cores[i].attributed_power_uw =
+				div64_u64(packages[pkg].power_uw[POWMON_DOMAIN_PKG],
+					  cores_in_pkg);
+		}
+	}
+}
+
+/* Read RAPL power limits from MSR_PKG_POWER_LIMIT (Intel only) */
+static void powmon_read_power_limits(u32 pkg_idx)
+{
+	u64 val;
+	int rep;
+
+	if (cpu_vendor != POWMON_VENDOR_INTEL)
+		return;
+	if (pkg_idx >= nr_packages)
+		return;
+
+	rep = packages[pkg_idx].representative_cpu;
+	if (rep < 0)
+		return;
+
+	if (read_rapl_msr_on_cpu(rep, MSR_PKG_POWER_LIMIT, &val))
+		return;
+
+	packages[pkg_idx].pl1_raw    = (u32)(val & 0x7FFF);
+	packages[pkg_idx].pl1_enable = (u32)((val >> 15) & 1);
+	packages[pkg_idx].pl1_clamp  = (u32)((val >> 16) & 1);
+	packages[pkg_idx].pl2_raw    = (u32)((val >> 32) & 0x7FFF);
+	packages[pkg_idx].pl2_enable = (u32)((val >> 47) & 1);
+	packages[pkg_idx].pl2_clamp  = (u32)((val >> 48) & 1);
+	packages[pkg_idx].power_limit_locked = (u32)((val >> 63) & 1);
+}
+
+/* Sample throttle status from MSR_CORE_PERF_LIMIT_REASONS (Intel only) */
+static void powmon_sample_throttle(void)
+{
+	u32 i;
+
+	if (cpu_vendor != POWMON_VENDOR_INTEL)
+		return;
+
+	for (i = 0; i < nr_packages; i++) {
+		u64 val;
+		int rep = packages[i].representative_cpu;
+		if (rep < 0)
+			continue;
+
+		if (read_rapl_msr_on_cpu(rep, MSR_CORE_PERF_LIMIT_REASONS, &val))
+			continue;
+
+		packages[i].throttle_active = (u32)(val & 0xFFFF);
+		packages[i].throttle_logged = (u32)((val >> 16) & 0xFFFF);
 	}
 }
 
@@ -752,6 +853,9 @@ static void powmon_work_fn(struct work_struct *work)
 
 	/* Sample RAPL counters */
 	powmon_sample_rapl();
+
+	/* Sample throttle status (Intel) */
+	powmon_sample_throttle();
 
 	/* Attribute energy to PIDs */
 	powmon_attribute_to_pids();
@@ -934,6 +1038,64 @@ static long powmon_ioctl_get_cgroup(unsigned long arg)
 	return -ENOENT;
 }
 
+static long powmon_ioctl_get_throttle(unsigned long arg)
+{
+	struct powmon_query_throttle query;
+
+	if (copy_from_user(&query, (void __user *)arg, sizeof(query)))
+		return -EFAULT;
+
+	if (query.package_id >= nr_packages)
+		return -EINVAL;
+
+	if (cpu_vendor != POWMON_VENDOR_INTEL)
+		return -ENODEV;
+
+	memset(&query.result, 0, sizeof(query.result));
+	query.result.package_id = query.package_id;
+	query.result.active_reasons = packages[query.package_id].throttle_active;
+	query.result.logged_reasons = packages[query.package_id].throttle_logged;
+	query.result.timestamp_ns = ktime_to_ns(ktime_get());
+
+	if (copy_to_user((void __user *)arg, &query, sizeof(query)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static long powmon_ioctl_get_power_limits(unsigned long arg)
+{
+	struct powmon_query_power_limits query;
+
+	if (copy_from_user(&query, (void __user *)arg, sizeof(query)))
+		return -EFAULT;
+
+	if (query.package_id >= nr_packages)
+		return -EINVAL;
+
+	if (cpu_vendor != POWMON_VENDOR_INTEL)
+		return -ENODEV;
+
+	/* Re-read in case limits changed at runtime */
+	powmon_read_power_limits(query.package_id);
+
+	memset(&query.result, 0, sizeof(query.result));
+	query.result.package_id = query.package_id;
+	query.result.pl1_mw     = packages[query.package_id].pl1_raw * (u32)power_unit_mw;
+	query.result.pl1_enable = packages[query.package_id].pl1_enable;
+	query.result.pl1_clamp  = packages[query.package_id].pl1_clamp;
+	query.result.pl2_mw     = packages[query.package_id].pl2_raw * (u32)power_unit_mw;
+	query.result.pl2_enable = packages[query.package_id].pl2_enable;
+	query.result.pl2_clamp  = packages[query.package_id].pl2_clamp;
+	query.result.locked     = packages[query.package_id].power_limit_locked;
+	query.result.timestamp_ns = ktime_to_ns(ktime_get());
+
+	if (copy_to_user((void __user *)arg, &query, sizeof(query)))
+		return -EFAULT;
+
+	return 0;
+}
+
 static long powmon_ioctl_set_config(unsigned long arg)
 {
 	struct powmon_config config;
@@ -1006,6 +1168,10 @@ static long powmon_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return powmon_ioctl_get_package(arg);
 	case POWMON_IOC_GET_CGROUP:
 		return powmon_ioctl_get_cgroup(arg);
+	case POWMON_IOC_GET_THROTTLE:
+		return powmon_ioctl_get_throttle(arg);
+	case POWMON_IOC_GET_POWER_LIMITS:
+		return powmon_ioctl_get_power_limits(arg);
 	case POWMON_IOC_SET_CONFIG:
 		return powmon_ioctl_set_config(arg);
 	case POWMON_IOC_GET_CONFIG:

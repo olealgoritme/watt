@@ -10,7 +10,10 @@
  *   powmon-cli core <id>         - Query per-core energy
  *   powmon-cli package <id>      - Query per-package energy
  *   powmon-cli config [interval] - Get/set sampling interval
+ *   powmon-cli service <unit>    - Query energy for a systemd service
  *   powmon-cli reset             - Reset all stats
+ *
+ * Options: --json, --csv for machine-readable output
  */
 
 #include <stdio.h>
@@ -20,11 +23,15 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <inttypes.h>
 
 #include "powmon.h"
 
 #define DEVICE_PATH "/dev/powmon"
+
+enum output_format { FMT_HUMAN, FMT_JSON, FMT_CSV };
+static enum output_format out_fmt = FMT_HUMAN;
 
 static const char *vendor_str(uint32_t v)
 {
@@ -65,6 +72,24 @@ static void cmd_info(int fd)
 
 	if (ioctl(fd, POWMON_IOC_GET_INFO, &info) < 0) {
 		perror("ioctl GET_INFO");
+		return;
+	}
+
+	if (out_fmt == FMT_JSON) {
+		printf("{\"vendor\":\"%s\",\"packages\":%u,\"cores\":%u,"
+		       "\"tracked_pids\":%u,\"sample_interval_ms\":%u,"
+		       "\"uptime_s\":%.2f,\"domain_mask\":%u}\n",
+		       vendor_str(info.vendor), info.nr_packages, info.nr_cores,
+		       info.nr_tracked_pids, info.sample_interval_ms,
+		       (double)info.uptime_ns / 1e9, info.domain_mask);
+		return;
+	}
+	if (out_fmt == FMT_CSV) {
+		printf("vendor,packages,cores,tracked_pids,sample_interval_ms,uptime_s,domain_mask\n");
+		printf("%s,%u,%u,%u,%u,%.2f,%u\n",
+		       vendor_str(info.vendor), info.nr_packages, info.nr_cores,
+		       info.nr_tracked_pids, info.sample_interval_ms,
+		       (double)info.uptime_ns / 1e9, info.domain_mask);
 		return;
 	}
 
@@ -130,6 +155,31 @@ static void cmd_pid(int fd, pid_t pid)
 
 	struct powmon_pid_energy *r = &query.result;
 
+	if (out_fmt == FMT_JSON) {
+		printf("{\"pid\":%d,\"comm\":\"%s\",\"tgid\":%d,"
+		       "\"cpu_time_s\":%.3f,\"cpu_power_w\":%.3f,"
+		       "\"dram_power_w\":%.3f,\"total_power_w\":%.3f,"
+		       "\"total_energy_mj\":%.3f}\n",
+		       r->pid, r->comm, r->tgid,
+		       (double)r->cpu_time_ns / 1e9,
+		       (double)r->cpu_power_uw / 1e6,
+		       (double)r->dram_power_uw / 1e6,
+		       (double)r->total_power_uw / 1e6,
+		       (double)r->total_energy_uj / 1e3);
+		return;
+	}
+	if (out_fmt == FMT_CSV) {
+		printf("pid,comm,tgid,cpu_time_s,cpu_power_w,dram_power_w,total_power_w,total_energy_mj\n");
+		printf("%d,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+		       r->pid, r->comm, r->tgid,
+		       (double)r->cpu_time_ns / 1e9,
+		       (double)r->cpu_power_uw / 1e6,
+		       (double)r->dram_power_uw / 1e6,
+		       (double)r->total_power_uw / 1e6,
+		       (double)r->total_energy_uj / 1e3);
+		return;
+	}
+
 	printf("=== PID %d (%s) ===\n", r->pid, r->comm);
 	printf("TGID:          %d\n", r->tgid);
 	printf("CPU time:      %.3f s\n", (double)r->cpu_time_ns / 1e9);
@@ -155,6 +205,21 @@ static void cmd_core(int fd, uint32_t core_id)
 
 	struct powmon_core_energy *r = &query.result;
 
+	if (out_fmt == FMT_JSON) {
+		printf("{\"core_id\":%u,\"package_id\":%u,"
+		       "\"energy_mj\":%.3f,\"power_w\":%.3f}\n",
+		       r->core_id, r->package_id,
+		       (double)r->energy_uj / 1e3, (double)r->power_uw / 1e6);
+		return;
+	}
+	if (out_fmt == FMT_CSV) {
+		printf("core_id,package_id,energy_mj,power_w\n");
+		printf("%u,%u,%.3f,%.3f\n",
+		       r->core_id, r->package_id,
+		       (double)r->energy_uj / 1e3, (double)r->power_uw / 1e6);
+		return;
+	}
+
 	printf("=== Core %u (Package %u) ===\n",
 	       r->core_id, r->package_id);
 	printf("Attributed energy: %.3f mJ\n",
@@ -173,6 +238,33 @@ static void cmd_package(int fd, uint32_t pkg_id)
 	}
 
 	struct powmon_package_energy *r = &query.result;
+
+	if (out_fmt == FMT_JSON) {
+		printf("{\"package_id\":%u,\"domain_mask\":%u,\"domains\":[",
+		       r->package_id, r->domain_mask);
+		int first = 1;
+		for (int d = 0; d < POWMON_DOMAIN_COUNT; d++) {
+			if (!(r->domain_mask & (1 << d))) continue;
+			if (!first) printf(",");
+			printf("{\"domain\":\"%s\",\"energy_j\":%.3f,\"power_w\":%.3f}",
+			       domain_str(d),
+			       (double)r->domains[d].energy_uj / 1e6,
+			       (double)r->domains[d].power_uw / 1e6);
+			first = 0;
+		}
+		printf("]}\n");
+		return;
+	}
+	if (out_fmt == FMT_CSV) {
+		printf("package_id,domain,energy_j,power_w\n");
+		for (int d = 0; d < POWMON_DOMAIN_COUNT; d++) {
+			if (!(r->domain_mask & (1 << d))) continue;
+			printf("%u,%s,%.3f,%.3f\n", r->package_id, domain_str(d),
+			       (double)r->domains[d].energy_uj / 1e6,
+			       (double)r->domains[d].power_uw / 1e6);
+		}
+		return;
+	}
 
 	printf("=== Package %u ===\n", r->package_id);
 	printf("Domain mask: 0x%x\n", r->domain_mask);
@@ -205,6 +297,14 @@ static void cmd_config(int fd, int argc, char **argv)
 			perror("ioctl GET_CONFIG");
 			return;
 		}
+		if (out_fmt == FMT_JSON) {
+			printf("{\"sample_interval_ms\":%u}\n", config.sample_interval_ms);
+			return;
+		}
+		if (out_fmt == FMT_CSV) {
+			printf("sample_interval_ms\n%u\n", config.sample_interval_ms);
+			return;
+		}
 		printf("Sample interval: %u ms\n", config.sample_interval_ms);
 	}
 }
@@ -216,6 +316,81 @@ static void cmd_reset(int fd)
 		return;
 	}
 	printf("Stats reset\n");
+}
+
+static uint64_t resolve_cgroup_id(const char *unit_name)
+{
+	char path[512];
+	struct stat st;
+
+	snprintf(path, sizeof path,
+		 "/sys/fs/cgroup/system.slice/%s", unit_name);
+	if (stat(path, &st) == 0)
+		return (uint64_t)st.st_ino;
+
+	snprintf(path, sizeof path,
+		 "/sys/fs/cgroup/system.slice/%s.service", unit_name);
+	if (stat(path, &st) == 0)
+		return (uint64_t)st.st_ino;
+
+	snprintf(path, sizeof path,
+		 "/sys/fs/cgroup/user.slice/%s", unit_name);
+	if (stat(path, &st) == 0)
+		return (uint64_t)st.st_ino;
+
+	return 0;
+}
+
+static void cmd_service(int fd, const char *unit_name)
+{
+	uint64_t cgid = resolve_cgroup_id(unit_name);
+	if (cgid == 0) {
+		fprintf(stderr, "Cannot find cgroup for service: %s\n", unit_name);
+		return;
+	}
+
+	struct powmon_query_cgroup query;
+	memset(&query, 0, sizeof query);
+	query.cgroup_id = cgid;
+
+	if (ioctl(fd, POWMON_IOC_GET_CGROUP, &query) < 0) {
+		if (errno == ENOENT)
+			fprintf(stderr, "Service %s not tracked by powmon\n", unit_name);
+		else
+			perror("ioctl GET_CGROUP");
+		return;
+	}
+
+	struct powmon_cgroup_energy *r = &query.result;
+
+	if (out_fmt == FMT_JSON) {
+		printf("{\"service\":\"%s\",\"nr_pids\":%u,"
+		       "\"cpu_power_w\":%.3f,\"dram_power_w\":%.3f,"
+		       "\"total_power_w\":%.3f,\"total_energy_mj\":%.3f}\n",
+		       unit_name, r->nr_pids,
+		       (double)r->cpu_power_uw / 1e6,
+		       (double)r->dram_power_uw / 1e6,
+		       (double)r->total_power_uw / 1e6,
+		       (double)r->total_energy_uj / 1e3);
+		return;
+	}
+	if (out_fmt == FMT_CSV) {
+		printf("service,nr_pids,cpu_power_w,dram_power_w,total_power_w,total_energy_mj\n");
+		printf("%s,%u,%.3f,%.3f,%.3f,%.3f\n",
+		       unit_name, r->nr_pids,
+		       (double)r->cpu_power_uw / 1e6,
+		       (double)r->dram_power_uw / 1e6,
+		       (double)r->total_power_uw / 1e6,
+		       (double)r->total_energy_uj / 1e3);
+		return;
+	}
+
+	printf("=== Service: %s ===\n", unit_name);
+	printf("Tracked PIDs:  %u\n", r->nr_pids);
+	printf("CPU power:     %.3f W\n", (double)r->cpu_power_uw / 1e6);
+	printf("DRAM power:    %.3f W\n", (double)r->dram_power_uw / 1e6);
+	printf("Total power:   %.3f W\n", (double)r->total_power_uw / 1e6);
+	printf("Total energy:  %.3f mJ\n", (double)r->total_energy_uj / 1e3);
 }
 
 static void usage(const char *prog)
@@ -232,18 +407,34 @@ static void usage(const char *prog)
 		"  core <id>         Query energy for a CPU core\n"
 		"  package <id>      Query energy for a CPU package\n"
 		"  config [ms]       Get/set sampling interval\n"
+		"  service <unit>    Query energy for a systemd service\n"
 		"  reset             Reset all tracking data\n"
+		"\n"
+		"Options:\n"
+		"  --json            Output in JSON format\n"
+		"  --csv             Output in CSV format\n"
 		"\n"
 		"Example:\n"
 		"  %s track-all\n"
 		"  sleep 5\n"
-		"  %s pid 1234\n",
+		"  %s pid 1234 --json\n",
 		prog, prog, prog);
 }
 
 int main(int argc, char **argv)
 {
 	int fd;
+
+	/* Strip --json / --csv from argv */
+	int nargc = 0;
+	char *nargv[64];
+	for (int i = 0; i < argc && i < 64; i++) {
+		if (strcmp(argv[i], "--json") == 0) { out_fmt = FMT_JSON; continue; }
+		if (strcmp(argv[i], "--csv") == 0)  { out_fmt = FMT_CSV;  continue; }
+		nargv[nargc++] = argv[i];
+	}
+	argc = nargc;
+	argv = nargv;
 
 	if (argc < 2) {
 		usage(argv[0]);
@@ -270,6 +461,8 @@ int main(int argc, char **argv)
 		cmd_package(fd, atoi(argv[2]));
 	} else if (strcmp(argv[1], "config") == 0) {
 		cmd_config(fd, argc - 2, argv + 2);
+	} else if (strcmp(argv[1], "service") == 0 && argc >= 3) {
+		cmd_service(fd, argv[2]);
 	} else if (strcmp(argv[1], "reset") == 0) {
 		cmd_reset(fd);
 	} else {

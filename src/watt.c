@@ -143,6 +143,22 @@ typedef struct {
     int       config_focus;
     char      status_msg[128];
     int       status_tick;
+
+    /* pause */
+    int      paused;
+
+    /* process filter */
+    FluxInput filter_input;
+    int       filter_active;
+
+    /* throttle (Intel) */
+    uint32_t throttle_active[POWMON_MAX_PACKAGES];
+    int      is_throttled;
+
+    /* power limits (Intel) */
+    double   pl1_w[POWMON_MAX_PACKAGES];
+    double   pl2_w[POWMON_MAX_PACKAGES];
+    int      has_power_limits;
 } App;
 
 static int has_dram(App *a) {
@@ -192,7 +208,33 @@ static void dev_poll(App *a) {
     }
     a->sys_total_w = a->sys_pkg_w + a->sys_dram_w;
 
-    float max_w = 150.0f;
+    /* throttle status (Intel) */
+    a->is_throttled = 0;
+    if (a->sysinfo.vendor == POWMON_VENDOR_INTEL) {
+        for (uint32_t i = 0; i < a->sysinfo.nr_packages && i < POWMON_MAX_PACKAGES; i++) {
+            struct powmon_query_throttle qt = { .package_id = i };
+            if (ioctl(a->dev_fd, POWMON_IOC_GET_THROTTLE, &qt) == 0) {
+                a->throttle_active[i] = qt.result.active_reasons;
+                if (qt.result.active_reasons) a->is_throttled = 1;
+            }
+        }
+    }
+
+    /* power limits (Intel, every 10 ticks) */
+    if (a->sysinfo.vendor == POWMON_VENDOR_INTEL && (a->tick % 10 == 0)) {
+        a->has_power_limits = 0;
+        for (uint32_t i = 0; i < a->sysinfo.nr_packages && i < POWMON_MAX_PACKAGES; i++) {
+            struct powmon_query_power_limits qpl = { .package_id = i };
+            if (ioctl(a->dev_fd, POWMON_IOC_GET_POWER_LIMITS, &qpl) == 0) {
+                a->pl1_w[i] = (double)qpl.result.pl1_mw / 1000.0;
+                a->pl2_w[i] = (double)qpl.result.pl2_mw / 1000.0;
+                if (qpl.result.pl1_enable) a->has_power_limits = 1;
+            }
+        }
+    }
+
+    float max_w = a->has_power_limits && a->pl2_w[0] > 0
+        ? (float)(a->pl2_w[0] * 1.2) : 150.0f;
     spark_push(&a->spark_pkg,   (float)(a->sys_pkg_w   / max_w));
     spark_push(&a->spark_dram,  (float)(a->sys_dram_w  / max_w));
     spark_push(&a->spark_total, (float)(a->sys_total_w / max_w));
@@ -286,11 +328,15 @@ static void render_tabbar(App *a, FluxSB *sb) {
         if (i < SCR_N - 1) flux_sb_append(sb, "│");
     }
     flux_sb_append(sb, RS BG0 "  ");
-    if (a->connected)
+    if (a->paused)
+        flux_sb_append(sb, RE BD " PAUSED " RS BG0 "  ");
+    if (a->connected) {
         flux_sb_appendf(sb, "%s%s⚡ %.1f W" RS, watt_color(a->sys_total_w), BD, a->sys_total_w);
-    else
+        if (a->is_throttled) flux_sb_append(sb, " " RE BD "⚠THR" RS);
+    } else
         flux_sb_append(sb, RE BD "✗ disconnected" RS);
-    flux_sb_appendf(sb, DM "  [1-%d] Tab q" RS "\n", SCR_N);
+    flux_sb_appendf(sb, DM "  [1-%d] Tab  %s" RS "\n", SCR_N,
+        a->paused ? "[space] resume" : "[space] pause");
     flux_sb_append(sb, DM);
     int W = flux_cols();
     for (int i = 0; i < W; i++) flux_sb_append(sb, "─");
@@ -343,6 +389,29 @@ static void render_overview(App *a, FluxSB *sb) {
     flux_sparkline(sb, a->spark_total.ring, SPARK_LEN, a->spark_total.head, AM);
     flux_sb_appendf(sb, "  " RE "peak %.1f W" RS, a->peak_total_w);
     flux_sb_nl(sb);
+
+    /* throttle warning */
+    if (a->is_throttled) {
+        flux_sb_append(sb, "\n  " RE BD "⚠ THROTTLED:" RS "  ");
+        uint32_t reasons = a->throttle_active[0];
+        if (reasons & POWMON_THROTTLE_THERMAL)  flux_sb_append(sb, RE "Thermal " RS);
+        if (reasons & POWMON_THROTTLE_PL1)      flux_sb_append(sb, OR "PL1 " RS);
+        if (reasons & POWMON_THROTTLE_PL2)      flux_sb_append(sb, OR "PL2 " RS);
+        if (reasons & POWMON_THROTTLE_PROCHOT)  flux_sb_append(sb, RE "PROCHOT " RS);
+        if (reasons & POWMON_THROTTLE_VR_THERM) flux_sb_append(sb, AM "VR-Therm " RS);
+        flux_sb_nl(sb);
+    }
+
+    /* power budget (PL1/PL2) */
+    if (a->has_power_limits) {
+        double pl1 = a->pl1_w[0], pl2 = a->pl2_w[0];
+        double pct = pl1 > 0 ? a->sys_pkg_w / pl1 * 100.0 : 0;
+        const char *pc = pct > 100 ? RE : pct > 85 ? OR : pct > 50 ? AM : GR;
+        flux_sb_appendf(sb, "\n  " DM "PL1: " WH BD "%.0f W" RS DM "  PL2: " WH BD "%.0f W" RS
+            DM "   [" RS "%s%.0f%%" RS DM " of PL1]" RS,
+            pl1, pl2, pc, pct);
+        flux_sb_nl(sb);
+    }
 
     flux_sb_append(sb, "\n  "); flux_divider(sb, 80, DM); flux_sb_append(sb, "\n\n");
 
@@ -401,6 +470,10 @@ static void render_overview(App *a, FluxSB *sb) {
 /* ═══════════════════════════════════════════════════════════════
  * SCREEN 1: PROCESSES
  * ═══════════════════════════════════════════════════════════════ */
+static int pid_matches_filter(PidRow *p, const char *filter) {
+    if (!filter || !filter[0]) return 1;
+    return strcasestr(p->comm, filter) != NULL;
+}
 static void render_procs(App *a, FluxSB *sb) {
     static const char *sort_labels_dram[] = {"Total(W)","CPU(W)","DRAM(W)","Energy(J)"};
     static const char *sort_labels_nodram[] = {"Total(W)","CPU(W)","Energy(J)"};
@@ -410,7 +483,18 @@ static void render_procs(App *a, FluxSB *sb) {
     int sort_idx = a->proc_sort % nsorts;
     flux_sb_append(sb, "\n");
     flux_sb_appendf(sb, "  " GR BD "◉ Process Power" RS DM "   %d tracked   sort: " AM BD "%s" RS DM
-        "   [s] sort  ↑↓/jk scroll\n\n" RS, a->pid_count, sort_labels[sort_idx]);
+        "   [s] sort  [/] filter  ↑↓/jk scroll\n" RS, a->pid_count, sort_labels[sort_idx]);
+
+    /* filter bar */
+    if (a->filter_active) {
+        flux_sb_append(sb, "  " CY "/" RS " ");
+        flux_input_render(&a->filter_input, sb, 30, CY, WH);
+        flux_sb_nl(sb);
+    } else if (a->filter_input.len > 0) {
+        flux_sb_appendf(sb, "  " DM "filter: " CY "%s" RS DM "  [/] edit  [Esc] clear" RS "\n",
+            a->filter_input.buf);
+    }
+    flux_sb_nl(sb);
 
     if (dram)
         flux_sb_appendf(sb, "  " DM "%-7s  %-16s  %9s  %9s  %9s  %10s  %8s" RS "\n",
@@ -423,15 +507,24 @@ static void render_procs(App *a, FluxSB *sb) {
     for (int i = 0; i < hdrw; i++) flux_sb_append(sb, "─");
     flux_sb_append(sb, RS "\n");
 
-    int vis = flux_rows() - 10; if (vis < 5) vis = 5;
-    if (a->proc_scroll > a->pid_count - vis) a->proc_scroll = a->pid_count - vis;
+    /* count matching PIDs */
+    int match_count = 0;
+    for (int i = 0; i < a->pid_count; i++)
+        if (pid_matches_filter(&a->pids[i], a->filter_input.buf)) match_count++;
+
+    int vis = flux_rows() - 12; if (vis < 5) vis = 5;
+    if (a->proc_scroll > match_count - vis) a->proc_scroll = match_count - vis;
     if (a->proc_scroll < 0) a->proc_scroll = 0;
-    if (a->proc_cursor >= a->pid_count) a->proc_cursor = a->pid_count - 1;
+    if (a->proc_cursor >= match_count) a->proc_cursor = match_count - 1;
     if (a->proc_cursor < 0) a->proc_cursor = 0;
 
-    for (int i = a->proc_scroll; i < a->pid_count && i < a->proc_scroll + vis; i++) {
+    int mi = 0;
+    for (int i = 0; i < a->pid_count; i++) {
+        if (!pid_matches_filter(&a->pids[i], a->filter_input.buf)) continue;
+        if (mi < a->proc_scroll) { mi++; continue; }
+        if (mi >= a->proc_scroll + vis) { mi++; continue; }
         PidRow *p = &a->pids[i];
-        int cur = (i == a->proc_cursor);
+        int cur = (mi == a->proc_cursor);
         if (cur) flux_sb_append(sb, BGX);
         flux_sb_appendf(sb, "  %-7d  " WH "%-16s" RS, p->pid, p->comm);
         if (cur) flux_sb_append(sb, BGX);
@@ -448,13 +541,15 @@ static void render_procs(App *a, FluxSB *sb) {
         flux_sb_appendf(sb, "  " DM "%8.1f" RS, p->cpu_time_s);
         if (cur) flux_sb_append(sb, RS);
         flux_sb_nl(sb);
+        mi++;
     }
     flux_sb_append(sb, "  " DM);
     for (int i = 0; i < hdrw; i++) flux_sb_append(sb, "─");
     flux_sb_append(sb, RS "\n");
     int end = a->proc_scroll + vis;
-    if (end > a->pid_count) end = a->pid_count;
-    flux_sb_appendf(sb, DM "  %d-%d of %d" RS "\n", a->proc_scroll+1, end, a->pid_count);
+    if (end > match_count) end = match_count;
+    flux_sb_appendf(sb, DM "  %d-%d of %d" RS "\n",
+        match_count > 0 ? a->proc_scroll+1 : 0, end, match_count);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -462,7 +557,9 @@ static void render_procs(App *a, FluxSB *sb) {
  * ═══════════════════════════════════════════════════════════════ */
 static void render_cores(App *a, FluxSB *sb) {
     flux_sb_append(sb, "\n");
-    flux_sb_appendf(sb, "  " BL BD "▦ Core Power Map" RS DM "   %u cores" RS "\n\n", a->sysinfo.nr_cores);
+    flux_sb_appendf(sb, "  " BL BD "▦ Core Power Map" RS DM "   %u cores  %s" RS "\n\n",
+        a->sysinfo.nr_cores,
+        a->sysinfo.vendor == POWMON_VENDOR_AMD ? "(direct MSR)" : "(estimated)");
 
     static const char *heat[] = {
         "\x1b[38;2;40;60;90m", "\x1b[38;2;50;120;180m",
@@ -672,6 +769,24 @@ static FluxCmd app_update(FluxModel *m, FluxMsg msg) {
     App *a = m->state;
 
     if (msg.type == MSG_KEY) {
+        /* filter input intercept (Processes tab, filter active) */
+        if (a->screen == SCR_PROCS && a->filter_active) {
+            if (flux_key_is(msg, "esc")) {
+                flux_input_clear(&a->filter_input);
+                a->filter_active = 0;
+                a->proc_cursor = 0; a->proc_scroll = 0;
+                return FLUX_CMD_NONE;
+            }
+            if (flux_key_is(msg, "enter")) {
+                a->filter_active = 0;
+                return FLUX_CMD_NONE;
+            }
+            if (flux_input_update(&a->filter_input, msg)) {
+                a->proc_cursor = 0; a->proc_scroll = 0;
+                return FLUX_CMD_NONE;
+            }
+        }
+
         /* config input intercept */
         if (a->screen == SCR_CONFIG && a->config_focus == 0) {
             if (flux_input_update(&a->interval_input, msg)) {
@@ -688,6 +803,13 @@ static FluxCmd app_update(FluxModel *m, FluxMsg msg) {
 
         if (flux_key_is(msg,"r") && !a->connected) { dev_open(a); return FLUX_CMD_NONE; }
 
+        /* space to toggle pause (guard against text input contexts) */
+        if (flux_key_is(msg," ") && !a->filter_active
+            && !(a->screen == SCR_CONFIG && a->config_focus == 0)) {
+            a->paused ^= 1;
+            return FLUX_CMD_NONE;
+        }
+
         switch (a->screen) {
         case SCR_PROCS:
             if (flux_key_is(msg,"up")||flux_key_is(msg,"k")) {
@@ -696,12 +818,21 @@ static FluxCmd app_update(FluxModel *m, FluxMsg msg) {
             }
             if (flux_key_is(msg,"down")||flux_key_is(msg,"j")) {
                 if (a->proc_cursor < a->pid_count-1) { a->proc_cursor++;
-                    int vis = flux_rows()-10; if(vis<5)vis=5;
+                    int vis = flux_rows()-12; if(vis<5)vis=5;
                     if (a->proc_cursor >= a->proc_scroll+vis) a->proc_scroll = a->proc_cursor-vis+1; }
             }
             if (flux_key_is(msg,"s")) {
                 int ns = has_dram(a) ? 4 : 3;
                 a->proc_sort = (a->proc_sort+1) % ns;
+            }
+            if (flux_key_is(msg,"/")) {
+                a->filter_active = 1;
+                flux_input_clear(&a->filter_input);
+                return FLUX_CMD_NONE;
+            }
+            if (flux_key_is(msg,"esc") && a->filter_input.len > 0) {
+                flux_input_clear(&a->filter_input);
+                a->proc_cursor = 0; a->proc_scroll = 0;
             }
             break;
         case SCR_CONFIG:
@@ -741,7 +872,8 @@ static FluxCmd app_update(FluxModel *m, FluxMsg msg) {
     }
 
     if (msg.type == MSG_CUSTOM && msg.u.custom.id == MSG_TICK_POLL) {
-        dev_poll(a);
+        if (!a->paused)
+            dev_poll(a);
         a->tick++;
         if (a->status_tick > 0) a->status_tick--;
         return tick_poll(a->poll_ms);
@@ -773,6 +905,7 @@ int main(void) {
     state.poll_ms = 500;
     state.dev_fd  = -1;
     flux_input_init(&state.interval_input, "10-10000");
+    flux_input_init(&state.filter_input, "filter...");
 
     FluxModel model = {
         .state = &state, .init = app_init,
