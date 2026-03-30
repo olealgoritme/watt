@@ -110,8 +110,6 @@ make package-tgz    # → build/watt-<version>.tar.gz (source with submodules)
 make package-deb    # → build/watt_<version>_amd64.deb (binaries + DKMS)
 ```
 
-Releases are created automatically when the `VERSION` file is updated on master.
-
 ## Dependencies
 
 - Linux headers (`linux-headers-$(uname -r)`) — for building the kernel module
