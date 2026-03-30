@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=watt
+Comment=Per-process power monitoring TUI
+Exec=watt
+Icon=watt
+Terminal=true
+Type=Application
+Categories=System;Monitor;
+Keywords=power;energy;rapl;watt;monitor;

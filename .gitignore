@@ -16,3 +16,4 @@ kernel/src/*.o.d
 kernel/.*.cmd
 kernel/src/.*.cmd
 kernel/.tmp_versions/
+build/
