@@ -21,8 +21,10 @@ all: watt module tools
 	@echo "    sudo insmod kernel/powmon.ko track_all=1"
 	@echo "    sudo $(BUILD)/watt"
 	@echo ""
-	@echo "  Install globally:"
-	@echo "    sudo make install"
+	@echo "  Install:"
+	@echo "    sudo make install           # install to /usr/local/bin"
+	@echo "    make package-deb            # build .deb with DKMS"
+	@echo "    make package-tgz            # build source tarball"
 
 # ── dependencies ─────────────────────────────────────────────
 submodules: $(FLUX_H)
