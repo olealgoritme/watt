@@ -89,23 +89,33 @@ sudo ./tools/powmon-diag.sh
 
 Dumps CPU info, RAPL domains, MSR availability, thermal zones, battery, GPU power, and powmon module status.
 
-## Project structure
+## Install from .deb
 
+Download the latest `.deb` from [Releases](https://github.com/olealgoritme/watt/releases):
+
+```bash
+sudo dpkg -i watt_*.deb
+sudo modprobe powmon track_all=1
+watt
 ```
-watt/
-├── src/watt.c              # main TUI app
-├── kernel/                 # powmon kernel module
-│   ├── src/powmon.c
-│   └── include/powmon.h    # shared UAPI header
-├── tools/                  # CLI utilities
-│   ├── powmon-cli.c
-│   ├── powmon-top.c
-│   └── powmon-diag.sh
-└── lib/flux.h/             # TUI framework (git submodule)
+
+The .deb includes DKMS support — the kernel module auto-rebuilds on kernel updates.
+
+## Packaging
+
+Build packages locally:
+
+```bash
+make package-tgz    # → build/watt-<version>.tar.gz (source with submodules)
+make package-deb    # → build/watt_<version>_amd64.deb (binaries + DKMS)
 ```
+
+Releases are created automatically when the `VERSION` file is updated on master.
 
 ## Dependencies
 
+- Linux headers (`linux-headers-$(uname -r)`) — for building the kernel module
+- libncurses-dev — for `powmon-top`
 - [flux.h](https://github.com/olealgoritme/flux.h) — single-header Elm Architecture TUI framework (pulled automatically as a git submodule)
 
 ## License
