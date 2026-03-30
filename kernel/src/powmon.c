@@ -713,11 +713,12 @@ static void powmon_attribute_to_cores(void)
 		/*
 		 * AMD Zen: read MSR_AMD_CORE_ENERGY_STATUS per logical CPU.
 		 * This gives actual hardware-measured per-core energy.
+		 * Use sample_interval_ms for power calculation (same as PID attribution)
+		 * since last_sample_time was already updated by powmon_sample_rapl().
 		 */
-		ktime_t now = ktime_get();
-		u64 dt_ns = ktime_to_ns(ktime_sub(now, last_sample_time));
-		if (dt_ns == 0)
-			dt_ns = 1;
+		u64 interval_ns = (u64)sample_interval_ms * 1000000ULL;
+		if (interval_ns == 0)
+			interval_ns = 1;
 
 		for (i = 0; i < nr_cores && i < (u32)num_online_cpus(); i++) {
 			u64 raw, prev, delta, energy_uj;
@@ -737,7 +738,7 @@ static void powmon_attribute_to_cores(void)
 			energy_uj = rapl_raw_to_uj(delta, energy_unit_uj_pkg);
 			cores[i].attributed_energy_uj = energy_uj;
 			cores[i].attributed_power_uw =
-				div64_u64(energy_uj * 1000000000ULL, dt_ns);
+				div64_u64(energy_uj * 1000000000ULL, interval_ns);
 		}
 		return;
 	}
