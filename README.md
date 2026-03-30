@@ -37,7 +37,6 @@ sudo ./watt
 
 | Key | Action |
 |-----|--------|
-| `1-4` | Switch tabs (Overview, Processes, Cores, Config) |
 | `Tab` / `Shift+Tab` | Cycle tabs |
 | `Space` | Pause / resume display |
 | `/` | Filter processes by name |

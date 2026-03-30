@@ -335,7 +335,7 @@ static void render_tabbar(App *a, FluxSB *sb) {
         if (a->is_throttled) flux_sb_append(sb, " " RE BD "⚠THR" RS);
     } else
         flux_sb_append(sb, RE BD "✗ disconnected" RS);
-    flux_sb_appendf(sb, DM "  [1-%d] Tab  %s" RS "\n", SCR_N,
+    flux_sb_appendf(sb, DM "  Tab q  %s" RS "\n",
         a->paused ? "[space] resume" : "[space] pause");
     flux_sb_append(sb, DM);
     int W = flux_cols();
@@ -798,8 +798,6 @@ static FluxCmd app_update(FluxModel *m, FluxMsg msg) {
         if (flux_key_is(msg,"ctrl+c") || flux_key_is(msg,"q")) return FLUX_CMD_QUIT;
         if (flux_key_is(msg,"tab")) { a->screen = (a->screen+1) % SCR_N; return FLUX_CMD_NONE; }
         if (flux_key_is(msg,"shift+tab")) { a->screen = (a->screen-1+SCR_N) % SCR_N; return FLUX_CMD_NONE; }
-        if (msg.u.key.key[0]>='1' && msg.u.key.key[0]<='0'+SCR_N && msg.u.key.key[1]=='\0')
-            { a->screen = msg.u.key.key[0]-'1'; return FLUX_CMD_NONE; }
 
         if (flux_key_is(msg,"r") && !a->connected) { dev_open(a); return FLUX_CMD_NONE; }
 
