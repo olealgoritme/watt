@@ -2,12 +2,14 @@
 /*
  * powmon.c - Per-process power monitoring kernel module
  *
- * Reads Intel/AMD RAPL MSRs on a timer, attributes energy to
- * individual PIDs proportional to their CPU time consumption,
- * and exposes results via /dev/powmon ioctl interface.
+ * Reads power data on a timer, attributes energy to individual PIDs
+ * proportional to their CPU time consumption, and exposes results
+ * via /dev/powmon ioctl interface.
  *
  * Supports: per-PID, per-core, per-cgroup, per-package granularity.
- * Target: Linux 6.x, x86_64 (Intel & AMD)
+ * Target: Linux 6.x
+ *   - x86_64: Intel/AMD RAPL MSRs
+ *   - aarch64: Apple Silicon via macsmc_hwmon (Asahi Linux)
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -34,20 +36,116 @@
 #include <linux/ktime.h>
 #include <linux/topology.h>
 #include <linux/version.h>
+
+#ifdef CONFIG_X86
 #include <asm/msr.h>
 #include <asm/processor.h>
 #include <asm/cpu_device_id.h>
-
 /* Linux 6.17+ renamed rdmsrl_safe → rdmsrq_safe */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
   #define rdmsrl_safe(msr, val)              rdmsrq_safe(msr, val)
   #define rdmsrl_safe_on_cpu(cpu, msr, val)  rdmsrq_safe_on_cpu(cpu, msr, val)
 #endif
+#endif /* CONFIG_X86 */
 
 #include "powmon.h"
 
+/* ---------- Architecture-specific power backend ---------- */
+
+#ifdef CONFIG_ARM64
+/*
+ * Apple Silicon (Asahi Linux) power backend.
+ *
+ * Reads system-level power from the macsmc_hwmon driver, which exposes
+ * Apple SMC power sensors via standard hwmon sysfs:
+ *   power1_input = Total System Power (microwatts)
+ *   power3_input = Heatpipe Power / CPU thermal (microwatts)
+ *
+ * Energy is computed from power * time each sampling interval.
+ */
+static char hwmon_power_total[128];  /* path to Total System Power */
+static char hwmon_power_cpu[128];    /* path to Heatpipe/CPU Power */
+static bool hwmon_has_cpu_power;
+
+static int read_sysfs_u64(const char *path, u64 *val)
+{
+	struct file *f;
+	char buf[32];
+	loff_t pos = 0;
+	ssize_t len;
+
+	f = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(f))
+		return PTR_ERR(f);
+
+	len = kernel_read(f, buf, sizeof(buf) - 1, &pos);
+	filp_close(f, NULL);
+
+	if (len <= 0)
+		return -EIO;
+
+	buf[len] = '\0';
+	return kstrtoull(buf, 10, val) ? -EINVAL : 0;
+}
+
+static int find_macsmc_hwmon(void)
+{
+	int i;
+	char path[128], name[64];
+
+	for (i = 0; i < 20; i++) {
+		struct file *f;
+		loff_t pos = 0;
+		ssize_t len;
+		u64 dummy;
+
+		snprintf(path, sizeof(path),
+			 "/sys/class/hwmon/hwmon%d/name", i);
+		f = filp_open(path, O_RDONLY, 0);
+		if (IS_ERR(f))
+			continue;
+
+		len = kernel_read(f, name, sizeof(name) - 1, &pos);
+		filp_close(f, NULL);
+
+		if (len <= 0)
+			continue;
+
+		name[len] = '\0';
+		while (len > 0 && (name[len-1] == '\n' || name[len-1] == '\r'))
+			name[--len] = '\0';
+
+		if (strcmp(name, "macsmc_hwmon") != 0)
+			continue;
+
+		/* Found it — verify power1_input is readable */
+		snprintf(hwmon_power_total, sizeof(hwmon_power_total),
+			 "/sys/class/hwmon/hwmon%d/power1_input", i);
+		if (read_sysfs_u64(hwmon_power_total, &dummy) != 0) {
+			pr_warn("macsmc_hwmon found but power1_input unreadable\n");
+			continue;
+		}
+
+		/* Heatpipe power (CPU thermal envelope) is optional */
+		snprintf(hwmon_power_cpu, sizeof(hwmon_power_cpu),
+			 "/sys/class/hwmon/hwmon%d/power3_input", i);
+		hwmon_has_cpu_power =
+			(read_sysfs_u64(hwmon_power_cpu, &dummy) == 0);
+
+		pr_info("Using macsmc_hwmon at hwmon%d (cpu_power=%s)\n",
+			i, hwmon_has_cpu_power ? "yes" : "no");
+		return 0;
+	}
+
+	pr_err("macsmc_hwmon not found — is the macsmc_hwmon module loaded?\n");
+	return -ENODEV;
+}
+#endif /* CONFIG_ARM64 */
+
+#ifdef CONFIG_X86
 /* ---------- RAPL MSR definitions ---------- */
 /* All MSR addresses come from <asm/msr-index.h> via <asm/msr.h> */
+#endif
 
 /* ---------- Module parameters ---------- */
 
@@ -179,6 +277,7 @@ static bool                     tracking_all;
  */
 static int powmon_read_energy_units(void)
 {
+#ifdef CONFIG_X86
 	u64 val;
 	u32 esu;
 	int ret;
@@ -224,8 +323,25 @@ static int powmon_read_energy_units(void)
 		esu, energy_unit_uj_pkg >> 10);
 
 	return 0;
+#elif defined(CONFIG_ARM64)
+	/*
+	 * Apple Silicon: power comes directly in microwatts from hwmon.
+	 * No RAPL-style energy counter units needed — we compute
+	 * energy = power * time each interval.
+	 */
+	raw_energy_unit_pkg = 0;
+	raw_energy_unit_dram = 0;
+	energy_unit_uj_pkg = 0;
+	energy_unit_uj_dram = 0;
+	power_unit_mw = 1;
+	pr_info("Apple Silicon: power readings via macsmc_hwmon (uW)\n");
+	return 0;
+#else
+	return -ENODEV;
+#endif
 }
 
+#ifdef CONFIG_X86
 /* Convert raw RAPL counter delta to microjoules */
 static inline u64 rapl_raw_to_uj(u64 raw_delta, u64 unit_scaled)
 {
@@ -292,6 +408,17 @@ static u32 domain_to_msr(u32 domain)
 	}
 	return 0;
 }
+#endif /* CONFIG_X86 */
+
+#ifdef CONFIG_ARM64
+static u32 detect_apple_domains(void)
+{
+	u32 mask = (1 << POWMON_DOMAIN_PKG); /* total system power */
+	if (hwmon_has_cpu_power)
+		mask |= (1 << POWMON_DOMAIN_CORE); /* heatpipe / CPU */
+	return mask;
+}
+#endif
 
 /* ---------- Topology detection ---------- */
 
@@ -323,6 +450,7 @@ static int powmon_detect_topology(void)
 
 static int powmon_detect_vendor(void)
 {
+#ifdef CONFIG_X86
 	struct cpuinfo_x86 *c = &boot_cpu_data;
 
 	if (c->x86_vendor == X86_VENDOR_INTEL) {
@@ -338,6 +466,21 @@ static int powmon_detect_vendor(void)
 		return -ENODEV;
 	}
 	return 0;
+#elif defined(CONFIG_ARM64)
+	int ret;
+
+	cpu_vendor = POWMON_VENDOR_APPLE;
+	ret = find_macsmc_hwmon();
+	if (ret) {
+		pr_err("Apple Silicon detected but no macsmc_hwmon found\n");
+		return ret;
+	}
+	pr_info("Detected Apple Silicon CPU (power via macsmc_hwmon)\n");
+	return 0;
+#else
+	pr_err("Unsupported architecture\n");
+	return -ENODEV;
+#endif
 }
 
 /* Forward declarations */
@@ -348,7 +491,7 @@ static void powmon_read_power_limits(u32 pkg_idx);
 static int powmon_init_packages(void)
 {
 	int cpu;
-	u32 i, d;
+	u32 i;
 
 	packages = kcalloc(nr_packages, sizeof(*packages), GFP_KERNEL);
 	if (!packages)
@@ -367,8 +510,10 @@ static int powmon_init_packages(void)
 			packages[pkg].representative_cpu = cpu;
 	}
 
+#ifdef CONFIG_X86
 	/* Detect RAPL domains and read initial counters */
 	for (i = 0; i < nr_packages; i++) {
+		u32 d;
 		int rep = packages[i].representative_cpu;
 		if (rep < 0)
 			continue;
@@ -393,6 +538,13 @@ static int powmon_init_packages(void)
 		/* Read initial power limits (Intel only) */
 		powmon_read_power_limits(i);
 	}
+#elif defined(CONFIG_ARM64)
+	/* Apple Silicon: single SoC package, domains from macsmc_hwmon */
+	packages[0].domain_mask = detect_apple_domains();
+	packages[0].representative_cpu = 0;
+	pr_info("Package 0: domain_mask=0x%x (Apple Silicon)\n",
+		packages[0].domain_mask);
+#endif
 
 	return 0;
 }
@@ -410,12 +562,14 @@ static int powmon_init_cores(void)
 			break;
 		cores[cpu].package_id = topology_physical_package_id(cpu);
 
+#ifdef CONFIG_X86
 		/* Read initial AMD per-core energy counter */
 		if (cpu_vendor == POWMON_VENDOR_AMD) {
 			u64 raw;
 			if (!read_rapl_msr_on_cpu(cpu, MSR_AMD_CORE_ENERGY_STATUS, &raw))
 				cores[cpu].prev_core_energy_raw = raw & RAPL_COUNTER_MAX;
 		}
+#endif
 	}
 
 	return 0;
@@ -553,54 +707,86 @@ static void reset_cgroup_stats(void)
 
 static void powmon_sample_rapl(void)
 {
-	u32 i, d;
 	ktime_t now = ktime_get();
 	u64 dt_ns = ktime_to_ns(ktime_sub(now, last_sample_time));
 
 	if (dt_ns == 0)
 		dt_ns = 1;
 
-	for (i = 0; i < nr_packages; i++) {
-		int rep = packages[i].representative_cpu;
-		if (rep < 0)
-			continue;
+#ifdef CONFIG_X86
+	{
+		u32 i, d;
 
-		for (d = 0; d < POWMON_DOMAIN_COUNT; d++) {
-			u32 msr;
-			u64 raw, delta, unit;
-			u64 prev;
-
-			if (!(packages[i].domain_mask & (1 << d)))
+		for (i = 0; i < nr_packages; i++) {
+			int rep = packages[i].representative_cpu;
+			if (rep < 0)
 				continue;
 
-			msr = domain_to_msr(d);
-			if (!msr || read_rapl_msr_on_cpu(rep, msr, &raw))
-				continue;
+			for (d = 0; d < POWMON_DOMAIN_COUNT; d++) {
+				u32 msr;
+				u64 raw, delta, unit;
+				u64 prev;
 
-			raw &= RAPL_COUNTER_MAX;
-			prev = packages[i].prev_energy_raw[d];
+				if (!(packages[i].domain_mask & (1 << d)))
+					continue;
 
-			/* Handle 32-bit wraparound */
-			if (raw >= prev)
-				delta = raw - prev;
-			else
-				delta = (RAPL_COUNTER_MAX - prev) + raw + 1;
+				msr = domain_to_msr(d);
+				if (!msr || read_rapl_msr_on_cpu(rep, msr, &raw))
+					continue;
 
-			packages[i].prev_energy_raw[d] = raw;
+				raw &= RAPL_COUNTER_MAX;
+				prev = packages[i].prev_energy_raw[d];
 
-			/* Convert to microjoules */
-			unit = (d == POWMON_DOMAIN_DRAM) ?
-				energy_unit_uj_dram : energy_unit_uj_pkg;
-			delta = rapl_raw_to_uj(delta, unit);
+				/* Handle 32-bit wraparound */
+				if (raw >= prev)
+					delta = raw - prev;
+				else
+					delta = (RAPL_COUNTER_MAX - prev) + raw + 1;
 
-			packages[i].delta_energy_uj[d] = delta;
-			packages[i].cum_energy_uj[d] += delta;
+				packages[i].prev_energy_raw[d] = raw;
 
-			/* Power = energy / time (in microwatts) */
-			packages[i].power_uw[d] =
-				div64_u64(delta * 1000000000ULL, dt_ns);
+				/* Convert to microjoules */
+				unit = (d == POWMON_DOMAIN_DRAM) ?
+					energy_unit_uj_dram : energy_unit_uj_pkg;
+				delta = rapl_raw_to_uj(delta, unit);
+
+				packages[i].delta_energy_uj[d] = delta;
+				packages[i].cum_energy_uj[d] += delta;
+
+				/* Power = energy / time (in microwatts) */
+				packages[i].power_uw[d] =
+					div64_u64(delta * 1000000000ULL, dt_ns);
+			}
 		}
 	}
+#elif defined(CONFIG_ARM64)
+	{
+		u64 power_uw, energy_delta_uj;
+
+		/* Total System Power → PKG domain */
+		if (read_sysfs_u64(hwmon_power_total, &power_uw) == 0) {
+			energy_delta_uj = div64_u64(power_uw * dt_ns,
+						    1000000000ULL);
+			packages[0].delta_energy_uj[POWMON_DOMAIN_PKG] =
+				energy_delta_uj;
+			packages[0].cum_energy_uj[POWMON_DOMAIN_PKG] +=
+				energy_delta_uj;
+			packages[0].power_uw[POWMON_DOMAIN_PKG] = power_uw;
+		}
+
+		/* Heatpipe Power → CORE domain (CPU thermal envelope) */
+		if (hwmon_has_cpu_power &&
+		    read_sysfs_u64(hwmon_power_cpu, &power_uw) == 0) {
+			energy_delta_uj = div64_u64(power_uw * dt_ns,
+						    1000000000ULL);
+			packages[0].delta_energy_uj[POWMON_DOMAIN_CORE] =
+				energy_delta_uj;
+			packages[0].cum_energy_uj[POWMON_DOMAIN_CORE] +=
+				energy_delta_uj;
+			packages[0].power_uw[POWMON_DOMAIN_CORE] = power_uw;
+		}
+	}
+#endif
 
 	last_sample_time = now;
 }
@@ -709,12 +895,11 @@ static void powmon_attribute_to_cores(void)
 {
 	u32 i;
 
+#ifdef CONFIG_X86
 	if (cpu_vendor == POWMON_VENDOR_AMD) {
 		/*
 		 * AMD Zen: read MSR_AMD_CORE_ENERGY_STATUS per logical CPU.
 		 * This gives actual hardware-measured per-core energy.
-		 * Use sample_interval_ms for power calculation (same as PID attribution)
-		 * since last_sample_time was already updated by powmon_sample_rapl().
 		 */
 		u64 interval_ns = (u64)sample_interval_ms * 1000000ULL;
 		if (interval_ns == 0)
@@ -742,10 +927,16 @@ static void powmon_attribute_to_cores(void)
 		}
 		return;
 	}
+#endif
 
-	/* Intel / fallback: distribute package PKG energy equally */
+	/*
+	 * Intel / Apple Silicon / fallback: distribute package energy
+	 * equally across cores.  On Apple Silicon, uses the heatpipe
+	 * (CPU thermal) power if available, otherwise total system power.
+	 */
 	for (i = 0; i < nr_cores && i < (u32)num_online_cpus(); i++) {
 		u32 pkg = cores[i].package_id;
+		u32 domain = POWMON_DOMAIN_PKG;
 		u64 pkg_delta;
 		u32 cores_in_pkg = 0;
 		u32 j;
@@ -753,7 +944,11 @@ static void powmon_attribute_to_cores(void)
 		if (pkg >= nr_packages)
 			continue;
 
-		pkg_delta = packages[pkg].delta_energy_uj[POWMON_DOMAIN_PKG];
+		/* Prefer CORE domain (heatpipe) for per-core split */
+		if (packages[pkg].domain_mask & (1 << POWMON_DOMAIN_CORE))
+			domain = POWMON_DOMAIN_CORE;
+
+		pkg_delta = packages[pkg].delta_energy_uj[domain];
 
 		for (j = 0; j < nr_cores; j++) {
 			if (cores[j].package_id == pkg)
@@ -764,7 +959,7 @@ static void powmon_attribute_to_cores(void)
 			cores[i].attributed_energy_uj =
 				div64_u64(pkg_delta, cores_in_pkg);
 			cores[i].attributed_power_uw =
-				div64_u64(packages[pkg].power_uw[POWMON_DOMAIN_PKG],
+				div64_u64(packages[pkg].power_uw[domain],
 					  cores_in_pkg);
 		}
 	}
@@ -773,6 +968,7 @@ static void powmon_attribute_to_cores(void)
 /* Read RAPL power limits from MSR_PKG_POWER_LIMIT (Intel only) */
 static void powmon_read_power_limits(u32 pkg_idx)
 {
+#ifdef CONFIG_X86
 	u64 val;
 	int rep;
 
@@ -795,11 +991,13 @@ static void powmon_read_power_limits(u32 pkg_idx)
 	packages[pkg_idx].pl2_enable = (u32)((val >> 47) & 1);
 	packages[pkg_idx].pl2_clamp  = (u32)((val >> 48) & 1);
 	packages[pkg_idx].power_limit_locked = (u32)((val >> 63) & 1);
+#endif
 }
 
 /* Sample throttle status from MSR_CORE_PERF_LIMIT_REASONS (Intel only) */
 static void powmon_sample_throttle(void)
 {
+#ifdef CONFIG_X86
 	u32 i;
 
 	if (cpu_vendor != POWMON_VENDOR_INTEL)
@@ -817,6 +1015,7 @@ static void powmon_sample_throttle(void)
 		packages[i].throttle_active = (u32)(val & 0xFFFF);
 		packages[i].throttle_logged = (u32)((val >> 16) & 0xFFFF);
 	}
+#endif
 }
 
 /* Auto-discover and track new PIDs */
@@ -1332,5 +1531,5 @@ module_exit(powmon_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("powmon");
-MODULE_DESCRIPTION("Per-process power monitoring via RAPL MSRs");
+MODULE_DESCRIPTION("Per-process power monitoring (RAPL MSRs / Apple Silicon SMC)");
 MODULE_VERSION("1.0");

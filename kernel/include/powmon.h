@@ -32,6 +32,7 @@
 #define POWMON_VENDOR_UNKNOWN 0
 #define POWMON_VENDOR_INTEL   1
 #define POWMON_VENDOR_AMD     2
+#define POWMON_VENDOR_APPLE   3
 
 /* Throttle reason bit flags (Intel MSR_CORE_PERF_LIMIT_REASONS) */
 #define POWMON_THROTTLE_PROCHOT       (1 << 0)

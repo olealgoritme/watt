@@ -7,9 +7,13 @@ POWMON_H := kernel/include/powmon.h
 FLUX_H   := lib/flux.h/flux.h
 BUILD    := build
 
+# check if kernel build dir exists (need kernel-devel installed)
+HAS_KDIR := $(wildcard $(KDIR)/Makefile)
+
 .PHONY: all watt module tools clean install uninstall load unload reload submodules \
         package-deb package-tgz
 
+ifneq ($(HAS_KDIR),)
 all: watt module tools
 	@echo ""
 	@echo "  Build complete (v$(VERSION)):"
@@ -25,6 +29,17 @@ all: watt module tools
 	@echo "    sudo make install           # install to /usr/local/bin"
 	@echo "    make package-deb            # build .deb with DKMS"
 	@echo "    make package-tgz            # build source tarball"
+else
+all: watt tools
+	@echo ""
+	@echo "  Build complete (v$(VERSION)) — userspace only:"
+	@echo "    watt          → $(BUILD)/watt"
+	@echo "    tools         → $(BUILD)/powmon-cli, $(BUILD)/powmon-top"
+	@echo ""
+	@echo "  NOTE: kernel module skipped (kernel headers not found at $(KDIR))"
+	@echo "        Install kernel-devel/linux-headers to build powmon.ko"
+	@echo ""
+endif
 
 # ── dependencies ─────────────────────────────────────────────
 submodules: $(FLUX_H)
@@ -38,9 +53,16 @@ watt: src/watt.c $(FLUX_H) $(POWMON_H)
 	    -I lib/flux.h -I kernel/include -o $(BUILD)/watt $< -lpthread
 
 # ── kernel module ────────────────────────────────────────────
+ifneq ($(HAS_KDIR),)
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD)/kernel modules
+else
+module:
+	@echo "  SKIP: kernel headers not found at $(KDIR)"
+	@echo "        Install kernel-devel or linux-headers package"
+endif
 
+ifneq ($(HAS_KDIR),)
 install: all
 	$(MAKE) -C $(KDIR) M=$(PWD)/kernel modules_install
 	depmod -a
@@ -50,6 +72,15 @@ install: all
 	@echo "    watt          → $(DESTDIR)/usr/local/bin/watt"
 	@echo "    powmon.ko     → /lib/modules/$(shell uname -r)/"
 	@echo ""
+else
+install: all
+	install -Dm755 $(BUILD)/watt $(DESTDIR)/usr/local/bin/watt
+	@echo ""
+	@echo "  Installed:"
+	@echo "    watt          → $(DESTDIR)/usr/local/bin/watt"
+	@echo "  NOTE: kernel module not installed (headers not found)"
+	@echo ""
+endif
 
 uninstall:
 	rm -f $(DESTDIR)/usr/local/bin/watt
@@ -66,9 +97,14 @@ $(BUILD)/powmon-top: tools/powmon-top.c $(POWMON_H)
 	$(CC) -Wall -O2 -I kernel/include -o $@ $< -lncurses
 
 # ── clean ────────────────────────────────────────────────────
+ifneq ($(HAS_KDIR),)
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD)/kernel clean
 	rm -rf $(BUILD)/
+else
+clean:
+	rm -rf $(BUILD)/
+endif
 
 # ── load/unload helpers ─────────────────────────────────────
 load: module
@@ -108,9 +144,9 @@ package-deb: watt tools
 	@echo "Depends: dkms, linux-headers-generic | linux-headers-$(shell uname -r)" >> $(BUILD)/deb/DEBIAN/control
 	@echo "Maintainer: olealgoritme" >> $(BUILD)/deb/DEBIAN/control
 	@echo "Description: Per-process power monitoring TUI for Linux" >> $(BUILD)/deb/DEBIAN/control
-	@echo " Reads RAPL MSRs via a custom kernel module and shows" >> $(BUILD)/deb/DEBIAN/control
+	@echo " Reads power data via a custom kernel module and shows" >> $(BUILD)/deb/DEBIAN/control
 	@echo " real-time wattage per process, core, and package." >> $(BUILD)/deb/DEBIAN/control
-	@echo " Supports Intel (Sandy Bridge+) and AMD (Zen+)." >> $(BUILD)/deb/DEBIAN/control
+	@echo " Supports Intel (Sandy Bridge+), AMD (Zen+), and Apple Silicon." >> $(BUILD)/deb/DEBIAN/control
 
 	@# postinst: register DKMS module
 	@echo '#!/bin/sh' > $(BUILD)/deb/DEBIAN/postinst
