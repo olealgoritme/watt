@@ -13,16 +13,24 @@
 Per-process power monitoring TUI for Linux.
 
 - Real-time wattage per process, core, and package
-- Custom kernel module (`powmon`) reads RAPL MSRs directly — communicates via `ioctl` on `/dev/powmon`
+- Custom kernel module (`powmon`) communicates via `ioctl` on `/dev/powmon`
 - Minimal overhead — no polling from userspace, no perf_events, no powercap sysfs
-- Throttle detection and PL1/PL2 power limit display (Intel)
-- Direct per-core energy measurement via `MSR_AMD_CORE_ENERGY_STATUS` (AMD Zen+)
-- Intel (Sandy Bridge+) and AMD (Zen+)
+- **Intel** (Sandy Bridge+): RAPL MSRs, throttle detection, PL1/PL2 power limit display
+- **AMD** (Zen+): RAPL MSRs, direct per-core energy via `MSR_AMD_CORE_ENERGY_STATUS`
+- **Apple Silicon** (Asahi Linux): system power via `macsmc_hwmon` SMC sensors
 
 ## Build
 
 ```bash
-sudo apt install linux-headers-$(uname -r) libncurses-dev   # prerequisites
+# Debian/Ubuntu
+sudo apt install linux-headers-$(uname -r) libncurses-dev
+
+# Fedora
+sudo dnf install kernel-devel ncurses-devel
+
+# Fedora Asahi Remix (Apple Silicon)
+sudo dnf install kernel-16k-devel ncurses-devel
+
 make            # builds everything (kernel module + watt + tools)
 ```
 
@@ -87,7 +95,7 @@ For hardware debugging and support, run the diagnostic script:
 sudo ./tools/powmon-diag.sh
 ```
 
-Dumps CPU info, RAPL domains, MSR availability, thermal zones, battery, GPU power, and powmon module status.
+Dumps CPU info, RAPL domains (x86) or SMC sensors (Apple Silicon), thermal zones, battery, GPU power, and powmon module status.
 
 ## Install from .deb
 
@@ -112,7 +120,8 @@ make package-deb    # → build/watt_<version>_amd64.deb (binaries + DKMS)
 
 ## Dependencies
 
-- Linux headers (`linux-headers-$(uname -r)`) — for building the kernel module
+- Linux headers (`linux-headers-$(uname -r)` / `kernel-devel` / `kernel-16k-devel`) — for building the kernel module
+- `macsmc_hwmon` kernel module (Apple Silicon only) — loaded by default on Asahi Linux
 - libncurses-dev — for `powmon-top`
 - [flux.h](https://github.com/olealgoritme/flux.h) — single-header Elm Architecture TUI framework (pulled automatically as a git submodule)
 
