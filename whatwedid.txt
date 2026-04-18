@@ -1,0 +1,218 @@
+WHAT WE DID — watt ARM64/Apple Silicon port
+=============================================
+Date: 2026-04-04
+
+## Goal
+Port the watt power monitoring tool (kernel module + TUI) from x86-only
+(Intel/AMD RAPL MSRs) to also work on ARM64 Apple Silicon (Asahi Linux).
+
+## System
+- MacBook Air M2 (2022)
+- Fedora Asahi Remix 40
+- Was running kernel: 6.11.0-400.asahi.fc40.aarch64+16k
+
+## Code changes (already committed + pushed)
+
+Branch: feat/arm64-apple-silicon-support
+Remote: origin (github.com:olealgoritme/watt)
+Commits:
+  7d880c9 add ARM64/Apple Silicon support via macsmc_hwmon
+  2b97e3c update README: document Apple Silicon and multi-distro build steps
+
+### Files changed:
+
+1. kernel/include/powmon.h
+   - Added POWMON_VENDOR_APPLE (3)
+
+2. kernel/src/powmon.c
+   - All x86 code gated behind #ifdef CONFIG_X86
+   - New ARM64 backend behind #ifdef CONFIG_ARM64
+   - find_macsmc_hwmon() — discovers macsmc_hwmon hwmon device at init
+   - read_sysfs_u64() — reads hwmon power values from kernel space
+   - Reads Total System Power (power1_input) -> PKG domain
+   - Reads Heatpipe Power (power3_input) -> CORE domain
+   - Energy computed as power_uw * dt_ns / 1e9
+   - PID attribution unchanged (proportional to CPU time)
+   - Throttle/power limits return -ENODEV on ARM64 (Intel only)
+
+3. Makefile
+   - Checks for kernel build dir existence (HAS_KDIR)
+   - Graceful skip if kernel-devel not installed
+   - Updated .deb description for Apple Silicon
+
+4. README.md
+   - Added Apple Silicon to feature list
+   - Added Fedora/Asahi build instructions
+   - Updated dependencies section
+
+## Packages installed/changed on this system
+
+1. Installed build deps:
+   - flex, bison, m4
+   - ncurses-devel
+
+2. Installed new kernel (from Asahi COPR F41 build):
+   - kernel-16k-6.14.6-400.asahi.fc41.aarch64
+   - kernel-16k-core-6.14.6-400.asahi.fc41.aarch64
+   - kernel-16k-devel-6.14.6-400.asahi.fc41.aarch64
+   - kernel-16k-modules-6.14.6-400.asahi.fc41.aarch64
+   - kernel-16k-modules-core-6.14.6-400.asahi.fc41.aarch64
+   - kernel-16k-modules-extra-6.14.6-400.asahi.fc41.aarch64
+
+   Downloaded from:
+   https://download.copr.fedorainfracloud.org/results/@asahi/kernel/fedora-41-aarch64/09026085-kernel/
+
+3. Upgraded:
+   - kernel-headers 6.11.0-400.asahi.fc40 -> 6.14.6-400.asahi.fc41
+
+4. Removed (by dnf as part of install, oldest kernel):
+   - kernel-16k-*-6.8.9-405.asahi.fc40
+
+5. GRUB was changed:
+   - GRUB_TIMEOUT=30 (was 1)
+   - GRUB_TIMEOUT_STYLE=menu (was hidden)
+   - grub2-editenv - unset menu_auto_hide
+   - Config: /etc/default/grub
+   - Regenerated: sudo grub2-mkconfig -o /boot/grub2/grub.cfg
+
+6. m1n1 bootloader was auto-updated during kernel install:
+   - "m1n1 updated at /run/.system-efi/m1n1/boot.bin"
+   - m1n1 package itself NOT upgraded (still m1n1-1.4.21-4.fc40)
+   - But boot.bin was regenerated with new kernel DTBs
+
+## Current issue — DISPLAY FLICKERING after reboot
+- ALL kernels now flicker (6.9.6, 6.11.0, 6.14.6)
+- 6.14.6 didn't boot into Linux at all
+- Currently booted: 6.11.0
+- Likely cause: m1n1 boot.bin was regenerated during kernel install,
+  possibly with DTBs from the fc41 kernel that are incompatible
+
+## Installed kernels still available
+- 6.14.6-400.asahi.fc41 (new, didn't boot)
+- 6.11.0-400.asahi.fc40 (current, flickering)
+- 6.9.6-400.asahi.fc40  (old, flickering)
+
+## ROOT CAUSE OF FLICKERING (found)
+The update-m1n1 script (/usr/sbin/update-m1n1) automatically picks DTBs
+from the NEWEST installed kernel. The fc41 kernel (6.14.6) shipped DTBs
+for ALL Apple devices including old iPhones (s5l8960x-*.dtb) — completely
+wrong for MacBook Air M2. Those bad DTBs got baked into boot.bin, breaking
+display init for EVERY kernel (m1n1 runs before any kernel).
+
+## FIX APPLIED
+Regenerated m1n1 with correct DTBs from the 6.11.0 kernel:
+  sudo DTBS="/lib/modules/6.11.0-400.asahi.fc40.aarch64+16k/dtb/apple/*.dtb" /usr/sbin/update-m1n1
+
+## AFTER REBOOT — what to do
+
+### If display is fixed:
+  1. Remove the fc41 kernel (it didn't boot anyway, and its DTBs break m1n1):
+     sudo dnf remove kernel-16k-6.14.6-400.asahi.fc41.aarch64 \
+       kernel-16k-core-6.14.6-400.asahi.fc41.aarch64 \
+       kernel-16k-modules-6.14.6-400.asahi.fc41.aarch64 \
+       kernel-16k-modules-core-6.14.6-400.asahi.fc41.aarch64 \
+       kernel-16k-modules-extra-6.14.6-400.asahi.fc41.aarch64
+
+  2. Keep kernel-16k-devel-6.14.6 (only has headers, no DTBs, needed to rebuild module)
+
+  3. Regenerate m1n1 again after removal to be safe:
+     sudo update-m1n1
+
+  4. Optionally restore GRUB to hidden/fast:
+     Edit /etc/default/grub:
+       GRUB_TIMEOUT=1
+       GRUB_TIMEOUT_STYLE=hidden
+     Then: sudo grub2-mkconfig -o /boot/grub2/grub.cfg
+
+### If display is STILL broken after reboot:
+  1. You can still SSH into the machine or use a TTY (Ctrl+Alt+F2)
+
+  2. Remove ALL fc41 packages we installed:
+     sudo dnf remove kernel-16k-6.14.6-400.asahi.fc41.aarch64 \
+       kernel-16k-core-6.14.6-400.asahi.fc41.aarch64 \
+       kernel-16k-modules-6.14.6-400.asahi.fc41.aarch64 \
+       kernel-16k-modules-core-6.14.6-400.asahi.fc41.aarch64 \
+       kernel-16k-modules-extra-6.14.6-400.asahi.fc41.aarch64 \
+       kernel-16k-devel-6.14.6-400.asahi.fc41.aarch64 \
+       kernel-headers-6.14.6-400.asahi.fc41.aarch64
+
+  3. Regenerate m1n1:
+     sudo update-m1n1
+
+  4. Reboot again
+
+  5. If STILL broken, restore m1n1 backup:
+     sudo mount /dev/nvme0n1p4 /mnt
+     sudo cp /mnt/m1n1/boot.bin.old /mnt/m1n1/boot.bin
+     sudo umount /mnt
+     sudo reboot
+
+## SECOND FIX ATTEMPT (after first reboot still flickered)
+  1. Removed ALL fc41 kernel packages:
+     sudo dnf remove kernel-16k-6.14.6-400.asahi.fc41.aarch64 \
+       kernel-16k-core-6.14.6-400.asahi.fc41.aarch64 \
+       kernel-16k-modules-6.14.6-400.asahi.fc41.aarch64 \
+       kernel-16k-modules-core-6.14.6-400.asahi.fc41.aarch64 \
+       kernel-16k-modules-extra-6.14.6-400.asahi.fc41.aarch64
+
+  2. Restored original m1n1 boot.bin from backup:
+     sudo mount /dev/nvme0n1p4 /mnt
+     sudo cp /mnt/m1n1/boot.bin.old /mnt/m1n1/boot.bin
+     sudo umount /mnt
+
+  3. Regenerated m1n1 cleanly (only fc40 kernels left):
+     sudo update-m1n1
+
+  4. Remaining kernels (both fc40):
+     - 6.11.0-400.asahi.fc40 <-- the one we were using, boot this
+     - 6.9.6-400.asahi.fc40
+
+  5. Still installed (harmless, just headers for module builds):
+     - kernel-16k-devel-6.14.6-400.asahi.fc41
+     - kernel-headers-6.14.6-400.asahi.fc41
+
+  REBOOT NOW — select kernel 6.11.0 from GRUB (the one that worked before)
+
+## IMPORTANT: 165-package system update also happened
+A dnf update ran at 09:58 PM (BEFORE our kernel install) and updated 165
+packages. Key ones that could cause display flickering:
+
+  - m1n1-1.4.21-4.fc40 (bootloader itself was upgraded)
+  - dracut-asahi-20250130-5.fc40 (initramfs)
+  - xorg-x11-server-Xwayland-24.1.6-1.fc40 (display server)
+  - Various firmware packages
+
+The boot.bin.old we restored was ALREADY from the upgraded m1n1 — not the
+original. So if flickering persists after reboot, the cause is likely one
+of these system updates, not our kernel install.
+
+## IF STILL FLICKERING AFTER REBOOT — downgrade suspects
+
+  1. Downgrade Xwayland (most likely culprit for flickering):
+     sudo dnf downgrade xorg-x11-server-Xwayland
+     Then reboot and test.
+
+  2. If still broken, downgrade m1n1 + dracut-asahi:
+     sudo dnf downgrade m1n1 dracut-asahi
+     sudo update-m1n1
+     Then reboot and test.
+
+  3. Nuclear option — roll back the entire 165-package update:
+     sudo dnf history list        # find the transaction ID for the big update
+     sudo dnf history undo <ID>   # undo that specific transaction
+     sudo update-m1n1
+     Then reboot.
+
+  4. To find the exact transaction ID:
+     sudo dnf history list | head -10
+     Look for the one with ~165 packages from Apr 02 around 21:58
+
+## Kernel source used for builds
+- /tmp/linux-asahi (git clone of AsahiLinux/linux, tag asahi-6.11.8-1)
+- /tmp/kernel-rpms (downloaded RPMs)
+- Both can be cleaned up
+
+## PR
+Branch pushed to: origin/feat/arm64-apple-silicon-support
+PR not yet created via gh CLI (gh not installed)
+Create at: https://github.com/olealgoritme/watt/pull/new/feat/arm64-apple-silicon-support
