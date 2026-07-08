@@ -717,7 +717,7 @@ static void render_disconnected(FluxSB *sb) {
         RE BD "  ✗ Cannot open /dev/powmon" RS "\n\n"
         WH "  The powmon kernel module is not loaded." RS "\n\n"
         DM "  To load it:" RS "\n"
-        CY "    sudo insmod powmon.ko track_all=1" RS "\n\n"
+        CY "    sudo insmod powmon.ko" RS "\n\n"
         WH BD "  Press [r] to retry, [q] to quit" RS);
     char box[2048]; flux_box(box, sizeof box, c, &FLUX_BORDER_DOUBLE, 48, RE, NULL);
     char *s = box;

@@ -57,7 +57,7 @@ MODULE_PARM_DESC(sample_interval_ms, "Sampling interval in milliseconds (default
 
 static bool track_all = false;
 module_param(track_all, bool, 0644);
-MODULE_PARM_DESC(track_all, "Track all processes on load (default: false)");
+MODULE_PARM_DESC(track_all, "Track all processes while a consumer holds /dev/powmon open (default: false)");
 
 /* ---------- Internal data structures ---------- */
 
@@ -164,7 +164,16 @@ static struct workqueue_struct *powmon_wq;
 static struct delayed_work      powmon_work;
 static ktime_t                  module_start_time;
 static ktime_t                  last_sample_time;
-static bool                     module_running;
+
+/*
+ * Sampling lifecycle: the sampler runs only while /dev/powmon is held
+ * open. The kernel calls .release when the last fd goes away no matter
+ * how the consumer dies (exit, crash, SIGKILL), so sampling can never
+ * outlive its consumers.
+ */
+static DEFINE_MUTEX(lifecycle_lock);
+static unsigned int             open_count;
+static bool                     sampling_active;
 static bool                     tracking_all;
 
 /* ---------- RAPL helpers ---------- */
@@ -846,7 +855,7 @@ static void powmon_discover_pids(void)
 
 static void powmon_work_fn(struct work_struct *work)
 {
-	if (!module_running)
+	if (!sampling_active)
 		return;
 
 	/* Discover new PIDs if tracking all */
@@ -865,9 +874,70 @@ static void powmon_work_fn(struct work_struct *work)
 	powmon_attribute_to_cores();
 
 	/* Reschedule */
-	if (module_running)
+	if (sampling_active)
 		queue_delayed_work(powmon_wq, &powmon_work,
 				   msecs_to_jiffies(sample_interval_ms));
+}
+
+/*
+ * Re-read the raw hardware counters and drop last-interval state so the
+ * first sample after (re)starting doesn't compute deltas spanning the
+ * idle gap.
+ */
+static void powmon_rebaseline(void)
+{
+	struct powmon_pid_entry *entry;
+	unsigned long flags;
+	u32 i, d;
+	int bkt;
+
+	for (i = 0; i < nr_packages; i++) {
+		int rep = packages[i].representative_cpu;
+		if (rep < 0)
+			continue;
+
+		for (d = 0; d < POWMON_DOMAIN_COUNT; d++) {
+			u32 msr;
+			u64 raw;
+
+			if (!(packages[i].domain_mask & (1 << d)))
+				continue;
+
+			msr = domain_to_msr(d);
+			if (msr && !read_rapl_msr_on_cpu(rep, msr, &raw))
+				packages[i].prev_energy_raw[d] = raw & RAPL_COUNTER_MAX;
+
+			packages[i].delta_energy_uj[d] = 0;
+			packages[i].power_uw[d] = 0;
+		}
+	}
+
+	for (i = 0; i < nr_cores && i < (u32)num_online_cpus(); i++) {
+		if (cpu_vendor == POWMON_VENDOR_AMD) {
+			u64 raw;
+
+			if (!read_rapl_msr_on_cpu(i, MSR_AMD_CORE_ENERGY_STATUS, &raw))
+				cores[i].prev_core_energy_raw = raw & RAPL_COUNTER_MAX;
+		}
+		cores[i].delta_active_ns = 0;
+		cores[i].attributed_energy_uj = 0;
+		cores[i].attributed_power_uw = 0;
+	}
+
+	spin_lock_irqsave(&pid_lock, flags);
+	hash_for_each(pid_table, bkt, entry, node) {
+		struct task_struct *task;
+
+		rcu_read_lock();
+		task = pid_task(find_vpid(entry->pid), PIDTYPE_PID);
+		if (task)
+			entry->prev_cpu_time_ns = task->utime + task->stime;
+		rcu_read_unlock();
+		entry->delta_cpu_ns = 0;
+	}
+	spin_unlock_irqrestore(&pid_lock, flags);
+
+	last_sample_time = ktime_get();
 }
 
 /* ---------- ioctl handlers ---------- */
@@ -1202,11 +1272,30 @@ static long powmon_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 static int powmon_open(struct inode *inode, struct file *file)
 {
+	mutex_lock(&lifecycle_lock);
+	if (open_count++ == 0) {
+		powmon_rebaseline();
+		tracking_all = track_all;
+		sampling_active = true;
+		queue_delayed_work(powmon_wq, &powmon_work,
+				   msecs_to_jiffies(sample_interval_ms));
+		pr_info("Consumer connected - sampling started (interval=%ums)\n",
+			sample_interval_ms);
+	}
+	mutex_unlock(&lifecycle_lock);
 	return 0;
 }
 
 static int powmon_release(struct inode *inode, struct file *file)
 {
+	mutex_lock(&lifecycle_lock);
+	if (--open_count == 0) {
+		sampling_active = false;
+		cancel_delayed_work_sync(&powmon_work);
+		tracking_all = false;
+		pr_info("Last consumer disconnected - sampling stopped\n");
+	}
+	mutex_unlock(&lifecycle_lock);
 	return 0;
 }
 
@@ -1255,6 +1344,18 @@ static int __init powmon_init(void)
 	if (ret)
 		goto err_cores;
 
+	/* Create the workqueue before exposing the device: open() starts
+	 * the sampler, so the device must not be reachable earlier. */
+	powmon_wq = create_singlethread_workqueue("powmon_wq");
+	if (!powmon_wq) {
+		ret = -ENOMEM;
+		goto err_wq;
+	}
+	INIT_DELAYED_WORK(&powmon_work, powmon_work_fn);
+
+	module_start_time = ktime_get();
+	last_sample_time = module_start_time;
+
 	/* Register character device */
 	ret = misc_register(&powmon_misc);
 	if (ret) {
@@ -1262,30 +1363,14 @@ static int __init powmon_init(void)
 		goto err_misc;
 	}
 
-	/* Create workqueue and start sampling */
-	powmon_wq = create_singlethread_workqueue("powmon_wq");
-	if (!powmon_wq) {
-		ret = -ENOMEM;
-		goto err_wq;
-	}
-
-	module_start_time = ktime_get();
-	last_sample_time = module_start_time;
-	module_running = true;
-	tracking_all = track_all;
-
-	INIT_DELAYED_WORK(&powmon_work, powmon_work_fn);
-	queue_delayed_work(powmon_wq, &powmon_work,
-			   msecs_to_jiffies(sample_interval_ms));
-
-	pr_info("Module loaded - /dev/%s ready (interval=%ums, track_all=%d)\n",
+	pr_info("Module loaded - /dev/%s ready (interval=%ums, track_all=%d), sampling starts on first open\n",
 		POWMON_DEVICE_NAME, sample_interval_ms, track_all);
 
 	return 0;
 
-err_wq:
-	misc_deregister(&powmon_misc);
 err_misc:
+	destroy_workqueue(powmon_wq);
+err_wq:
 	kfree(cores);
 err_cores:
 	kfree(packages);
@@ -1302,12 +1387,13 @@ static void __exit powmon_exit(void)
 
 	pr_info("Unloading power monitor module\n");
 
-	module_running = false;
+	/* No fds can be open here (fops owner holds the module refcount),
+	 * so sampling is already stopped; cancel is just belt-and-braces. */
+	misc_deregister(&powmon_misc);
 
+	sampling_active = false;
 	cancel_delayed_work_sync(&powmon_work);
 	destroy_workqueue(powmon_wq);
-
-	misc_deregister(&powmon_misc);
 
 	/* Free PID entries */
 	hash_for_each_safe(pid_table, bkt, tmp, pid_entry, node) {
@@ -1333,4 +1419,4 @@ module_exit(powmon_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("powmon");
 MODULE_DESCRIPTION("Per-process power monitoring via RAPL MSRs");
-MODULE_VERSION("1.0");
+MODULE_VERSION("0.1.1");
