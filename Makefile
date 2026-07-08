@@ -18,7 +18,7 @@ all: watt module tools
 	@echo "    tools         → $(BUILD)/powmon-cli, $(BUILD)/powmon-top"
 	@echo ""
 	@echo "  Quick start:"
-	@echo "    sudo insmod kernel/powmon.ko track_all=1"
+	@echo "    sudo insmod kernel/powmon.ko"
 	@echo "    sudo $(BUILD)/watt"
 	@echo ""
 	@echo "  Install:"
